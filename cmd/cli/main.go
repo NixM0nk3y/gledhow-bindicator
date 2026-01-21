@@ -212,11 +212,8 @@ func interactive(addr, password string) error {
 	fmt.Println("Connected! Type 'quit' or Ctrl+C to exit.")
 	fmt.Println()
 
-	// Read welcome message
-	conn.SetReadDeadline(time.Now().Add(readTimeout))
-	welcome := make([]byte, 1024)
-	n, _ := conn.Read(welcome)
-	fmt.Print(string(welcome[:n]))
+	// Read and display welcome message (banner + prompt)
+	readUntilPrompt(conn, true)
 
 	// Interactive loop
 	scanner := bufio.NewScanner(os.Stdin)
@@ -575,6 +572,14 @@ func authenticate(conn net.Conn, password string) error {
 	return nil
 }
 
+// cleanOutput removes carriage returns and normalizes line endings for display.
+func cleanOutput(s string) string {
+	// Remove carriage returns (^M) - device may echo these back
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "")
+	return s
+}
+
 // stripTelnetIAC removes telnet IAC (Interpret As Command) sequences from data.
 // IAC = 0xFF, followed by command byte and possibly option byte.
 func stripTelnetIAC(data []byte) []byte {
@@ -601,6 +606,13 @@ func stripTelnetIAC(data []byte) []byte {
 // consumeUntilPrompt reads from connection until we see "> " prompt or timeout.
 // This ensures we fully consume welcome messages before sending commands.
 func consumeUntilPrompt(conn net.Conn) {
+	readUntilPrompt(conn, false)
+}
+
+// readUntilPrompt reads from connection until we see "> " prompt or timeout.
+// If print is true, outputs the data (minus the trailing prompt) to stdout.
+// Returns the accumulated data.
+func readUntilPrompt(conn net.Conn, print bool) string {
 	buf := make([]byte, 256)
 	accumulated := ""
 	deadline := time.Now().Add(readTimeout)
@@ -612,13 +624,31 @@ func consumeUntilPrompt(conn net.Conn) {
 			accumulated += string(stripTelnetIAC(buf[:n]))
 			// Check if we've seen the prompt
 			if strings.Contains(accumulated, "> ") {
-				return
+				if print {
+					// Print everything up to (but not including) the final "> "
+					output := cleanOutput(accumulated)
+					if idx := strings.LastIndex(output, "> "); idx >= 0 {
+						output = output[:idx]
+					}
+					output = strings.TrimSpace(output)
+					if output != "" {
+						fmt.Println(output)
+					}
+				}
+				return accumulated
 			}
 		}
 		if err != nil {
-			return
+			if print && accumulated != "" {
+				fmt.Print(strings.TrimSpace(accumulated))
+			}
+			return accumulated
 		}
 	}
+	if print && accumulated != "" {
+		fmt.Print(strings.TrimSpace(accumulated))
+	}
+	return accumulated
 }
 
 // extractUF2Binary extracts the raw binary from a UF2 container file
