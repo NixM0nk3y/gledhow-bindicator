@@ -2,6 +2,8 @@
 
 An over-engineered embedded bin collection indicator using TinyGo and Raspberry Pi Pico 2. The device monitors bin collection schedules via MQTT and indicates upcoming collections using LEDs.
 
+![Three model bins under model street lights](_media/bindicator.png)
+
 ## Architecture
 
 ```
