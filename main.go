@@ -318,50 +318,86 @@ func main() {
 
 			feedWatchdogIfHealthy()
 
-			// Track MQTT attempt
-			wifiStats.lastMQTTAttempt = time.Now()
+			// MQTT retry with exponential backoff: 16s -> 32s -> 60s (max)
+			const (
+				mqttMinBackoff = 16 * time.Second
+				mqttMaxBackoff = 60 * time.Second
+				mqttMaxRetries = 3
+			)
+			var mqttSuccess bool
+			mqttBackoff := mqttMinBackoff
 
-			// Start child span for MQTT refresh
+			// Start child span for MQTT refresh (covers all retries)
 			mqttSpanIdx := telemetry.StartSpan(stack, "mqtt-refresh")
 
-			logger.Info("schedule:fetching")
+			for attempt := 0; attempt <= mqttMaxRetries; attempt++ {
+				// Track MQTT attempt
+				wifiStats.lastMQTTAttempt = time.Now()
 
-			// Fetch schedule via MQTT (also syncs time from response)
-			jobs, err := fetchScheduleViaMQTT(stack, brokerAddr, logger)
-			if err != nil {
-				telemetry.EndSpan(mqttSpanIdx, false) // Mark span as failed
-				logger.Error("mqtt:failed", slog.String("err", err.Error()))
-				wifiStats.mqttFailCount++
-				consecutiveFailures++
-				logger.Warn("watchdog:failure-count",
-					slog.Int("consecutive", consecutiveFailures),
-					slog.Int("max", maxConsecutiveFailures),
-				)
-				logger.Info("schedule:using-cached",
-					slog.Int("cached_jobs", len(getJobs())),
-				)
-				checkSystemHealth(logger)
-			} else {
-				// End MQTT span successfully
-				telemetry.EndSpan(mqttSpanIdx, true)
+				if attempt > 0 {
+					logger.Info("mqtt:backoff",
+						slog.Int("attempt", attempt+1),
+						slog.Duration("wait", mqttBackoff),
+					)
+					sleepWithWatchdog(mqttBackoff)
+					// Exponential backoff, capped at max
+					mqttBackoff = mqttBackoff * 2
+					if mqttBackoff > mqttMaxBackoff {
+						mqttBackoff = mqttMaxBackoff
+					}
+				}
 
-				// Track MQTT success
-				wifiStats.lastMQTTSuccess = time.Now()
-				wifiStats.mqttSuccessCount++
-				lastScheduleFetch = time.Now()
+				feedWatchdogIfHealthy()
+				logger.Info("schedule:fetching", slog.Int("attempt", attempt+1))
 
-				// Record metrics
-				telemetry.RecordCounter("mqtt.success.count", int64(wifiStats.mqttSuccessCount))
-				telemetry.RecordCounter("mqtt.fail.count", int64(wifiStats.mqttFailCount))
+				// Fetch schedule via MQTT
+				jobs, err := fetchScheduleViaMQTT(stack, brokerAddr, logger)
+				if err != nil {
+					logger.Error("mqtt:failed",
+						slog.String("err", err.Error()),
+						slog.Int("attempt", attempt+1),
+					)
+					wifiStats.mqttFailCount++
 
-				// Success - reset failure count and update timestamp
-				consecutiveFailures = 0
-				lastSuccessfulRefresh = time.Now()
-				logger.Info("schedule:fetched",
-					slog.Int("jobs", len(jobs)),
-					slog.String("time", lastSuccessfulRefresh.Format("15:04:05")),
-				)
+					// If more retries available, continue; otherwise fail
+					if attempt < mqttMaxRetries {
+						continue
+					}
+
+					// All retries exhausted
+					telemetry.EndSpan(mqttSpanIdx, false)
+					consecutiveFailures++
+					logger.Warn("watchdog:failure-count",
+						slog.Int("consecutive", consecutiveFailures),
+						slog.Int("max", maxConsecutiveFailures),
+					)
+					logger.Info("schedule:using-cached",
+						slog.Int("cached_jobs", len(getJobs())),
+					)
+					checkSystemHealth(logger)
+				} else {
+					// Success
+					telemetry.EndSpan(mqttSpanIdx, true)
+					wifiStats.lastMQTTSuccess = time.Now()
+					wifiStats.mqttSuccessCount++
+					lastScheduleFetch = time.Now()
+
+					// Record metrics
+					telemetry.RecordCounter("mqtt.success.count", int64(wifiStats.mqttSuccessCount))
+					telemetry.RecordCounter("mqtt.fail.count", int64(wifiStats.mqttFailCount))
+
+					// Success - reset failure count and update timestamp
+					consecutiveFailures = 0
+					lastSuccessfulRefresh = time.Now()
+					logger.Info("schedule:fetched",
+						slog.Int("jobs", len(jobs)),
+						slog.String("time", lastSuccessfulRefresh.Format("15:04:05")),
+					)
+					mqttSuccess = true
+					break // Exit retry loop on success
+				}
 			}
+			_ = mqttSuccess // Avoid unused variable warning
 		}
 
 		feedWatchdogIfHealthy()
