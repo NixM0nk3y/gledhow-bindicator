@@ -190,6 +190,11 @@ func otaServerLoop() {
 			continue
 		}
 
+		// Pause telemetry BEFORE logging connection - ensures no network contention
+		// This blocks until any in-progress HTTP operations complete
+		telemetry.Pause()
+		SetBindicatorPaused(true)
+
 		logger.Info("ota:connected", slog.String("ip", formatRemoteIP(conn.RemoteAddr())))
 
 		// Handle OTA session
@@ -208,6 +213,10 @@ func otaServerLoop() {
 			time.Sleep(100 * time.Millisecond)
 		}
 		conn.Abort()
+
+		// Resume background tasks after connection cleanup
+		SetBindicatorPaused(false)
+		telemetry.Resume()
 		logger.Info("ota:disconnected")
 
 		// Disable OTA after successful session (security: minimize window)
@@ -216,21 +225,8 @@ func otaServerLoop() {
 }
 
 // handleOTASession handles a single OTA update session
+// Note: Caller is responsible for pausing/resuming telemetry and bindicator
 func handleOTASession(conn *tcp.Conn, logger *slog.Logger) {
-	logger.Warn("ota:pausing-background-tasks")
-
-	// Pause telemetry and bindicator during OTA to avoid network contention
-	// Note: We don't flush here to avoid stability issues - flush happens just before reboot
-	telemetry.Pause()
-	SetBindicatorPaused(true)
-	defer func() {
-		// Resume if we return without rebooting (error case)
-		SetBindicatorPaused(false)
-		telemetry.Resume()
-		logger.Warn("ota:resuming-background-tasks")
-		telemetry.Flush()
-	}()
-
 	var readBuf [128]byte // Large enough for DONE + 64-char hash + newline
 
 	// Wait for "OTA\n" initiation
