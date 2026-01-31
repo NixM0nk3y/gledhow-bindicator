@@ -13,6 +13,7 @@ import (
 
 	"openenterprise/bindicator/credentials"
 	"openenterprise/bindicator/ota"
+	"openenterprise/bindicator/telemetry"
 	"openenterprise/bindicator/version"
 
 	"github.com/soypat/lneto/tcp"
@@ -40,23 +41,25 @@ var (
 
 // Console commands
 const (
-	cmdHelp      = "help"
-	cmdStatus    = "status"
-	cmdRefresh   = "refresh"
-	cmdTime      = "time"
-	cmdJobs      = "jobs"
-	cmdLeds      = "leds"
-	cmdVersion   = "version"
-	cmdNet       = "net"
-	cmdWifi      = "wifi"
-	cmdSleep     = "sleep"
-	cmdLedGreen  = "led-green"
-	cmdLedBlack  = "led-black"
-	cmdLedBrown  = "led-brown"
-	cmdNextJob   = "next"
-	cmdOTA       = "ota"
-	cmdOTAEnable = "ota-enable"
-	cmdReboot    = "reboot"
+	cmdHelp            = "help"
+	cmdStatus          = "status"
+	cmdRefresh         = "refresh"
+	cmdTime            = "time"
+	cmdJobs            = "jobs"
+	cmdLeds            = "leds"
+	cmdVersion         = "version"
+	cmdNet             = "net"
+	cmdWifi            = "wifi"
+	cmdSleep           = "sleep"
+	cmdLedGreen        = "led-green"
+	cmdLedBlack        = "led-black"
+	cmdLedBrown        = "led-brown"
+	cmdNextJob         = "next"
+	cmdOTA             = "ota"
+	cmdOTAEnable       = "ota-enable"
+	cmdReboot          = "reboot"
+	cmdTelemetry       = "telemetry"
+	cmdTelemetryFlush  = "telemetry-flush"
 )
 
 // consoleServer runs a TCP debug console on port 23
@@ -119,7 +122,7 @@ func consoleServer(
 			continue
 		}
 
-		logger.Info("console:connected")
+		logger.Info("console:connected", slog.String("ip", formatRemoteIP(conn.RemoteAddr())))
 
 		// Authenticate before allowing access
 		if !authenticateConsole(&conn) {
@@ -247,6 +250,7 @@ func processCommand(conn *tcp.Conn, stack *xnet.StackAsync, cmd []byte, logger *
 		writeConsole(conn, "Commands: help version status net wifi time jobs next leds ota\r\n")
 		writeConsole(conn, "  refresh, sleep <dur>, ota-enable [dur], reboot\r\n")
 		writeConsole(conn, "  led-green, led-black, led-brown\r\n")
+		writeConsole(conn, "  telemetry, telemetry-flush\r\n")
 
 	case bytesEqual(cmd, []byte(cmdStatus)):
 		if systemHealthy {
@@ -516,6 +520,40 @@ func processCommand(conn *tcp.Conn, stack *xnet.StackAsync, cmd []byte, logger *
 		conn.Flush()
 		time.Sleep(100 * time.Millisecond)
 		ota.Reboot()
+
+	case bytesEqual(cmd, []byte(cmdTelemetry)):
+		enabled, qLogs, qMetrics, qSpans, sLogs, sMetrics, sSpans, errs, collector := telemetry.Status()
+		writeConsole(conn, "Telemetry Status:\r\n")
+		writeConsole(conn, "  Enabled:    ")
+		if enabled {
+			writeConsole(conn, "yes\r\n")
+		} else {
+			writeConsole(conn, "no\r\n")
+		}
+		writeConsole(conn, "  Collector:  ")
+		writeConsole(conn, collector)
+		writeConsole(conn, "\r\n  Queued:\r\n")
+		writeConsole(conn, "    Logs:     ")
+		writeInt(conn, qLogs)
+		writeConsole(conn, "\r\n    Metrics:  ")
+		writeInt(conn, qMetrics)
+		writeConsole(conn, "\r\n    Spans:    ")
+		writeInt(conn, qSpans)
+		writeConsole(conn, "\r\n  Sent:\r\n")
+		writeConsole(conn, "    Logs:     ")
+		writeInt(conn, sLogs)
+		writeConsole(conn, "\r\n    Metrics:  ")
+		writeInt(conn, sMetrics)
+		writeConsole(conn, "\r\n    Spans:    ")
+		writeInt(conn, sSpans)
+		writeConsole(conn, "\r\n  Errors:     ")
+		writeInt(conn, errs)
+		writeConsole(conn, "\r\n")
+
+	case bytesEqual(cmd, []byte(cmdTelemetryFlush)):
+		writeConsole(conn, "Flushing telemetry queues...\r\n")
+		telemetry.Flush()
+		writeConsole(conn, "Flush complete\r\n")
 
 	default:
 		writeConsole(conn, "Unknown command: ")
@@ -811,4 +849,39 @@ func parseDuration(s []byte) time.Duration {
 	default:
 		return time.Duration(num) * time.Second
 	}
+}
+
+// formatRemoteIP formats a remote IP address as a string for logging
+func formatRemoteIP(addr []byte) string {
+	if len(addr) == 4 {
+		// IPv4
+		var buf [15]byte // max "255.255.255.255"
+		pos := 0
+		for i := 0; i < 4; i++ {
+			if i > 0 {
+				buf[pos] = '.'
+				pos++
+			}
+			pos += writeIntToBuf(buf[pos:], int(addr[i]))
+		}
+		return string(buf[:pos])
+	}
+	return "unknown"
+}
+
+// writeIntToBuf writes an integer to a byte buffer, returns bytes written
+func writeIntToBuf(buf []byte, n int) int {
+	if n == 0 {
+		buf[0] = '0'
+		return 1
+	}
+	var digits [3]byte
+	i := len(digits)
+	for n > 0 && i > 0 {
+		i--
+		digits[i] = byte('0' + n%10)
+		n /= 10
+	}
+	copy(buf, digits[i:])
+	return len(digits) - i
 }

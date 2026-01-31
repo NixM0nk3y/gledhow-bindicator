@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"openenterprise/bindicator/ota"
+	"openenterprise/bindicator/telemetry"
 
 	"github.com/soypat/lneto/tcp"
 	"github.com/soypat/lneto/x/xnet"
@@ -189,7 +190,7 @@ func otaServerLoop() {
 			continue
 		}
 
-		logger.Info("ota:connected")
+		logger.Info("ota:connected", slog.String("ip", formatRemoteIP(conn.RemoteAddr())))
 
 		// Handle OTA session
 		func() {
@@ -216,6 +217,21 @@ func otaServerLoop() {
 
 // handleOTASession handles a single OTA update session
 func handleOTASession(conn *tcp.Conn, logger *slog.Logger) {
+	// Log and flush before pausing so the message gets sent
+	logger.Warn("ota:pausing-background-tasks")
+	telemetry.Flush()
+
+	// Pause telemetry and bindicator during OTA to avoid network contention
+	telemetry.Pause()
+	SetBindicatorPaused(true)
+	defer func() {
+		// Resume if we return without rebooting (error case)
+		SetBindicatorPaused(false)
+		telemetry.Resume()
+		logger.Warn("ota:resuming-background-tasks")
+		telemetry.Flush()
+	}()
+
 	var readBuf [128]byte // Large enough for DONE + 64-char hash + newline
 
 	// Wait for "OTA\n" initiation

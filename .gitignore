@@ -2,6 +2,9 @@
 build.uf2
 bindicator-cli
 
+#
+coverage.out
+
 # Credentials and config
 *.text
 .env

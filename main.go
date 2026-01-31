@@ -13,6 +13,7 @@ import (
 	"openenterprise/bindicator/config"
 	"openenterprise/bindicator/credentials"
 	"openenterprise/bindicator/ota"
+	"openenterprise/bindicator/telemetry"
 	"openenterprise/bindicator/version"
 
 	"github.com/soypat/cyw43439"
@@ -123,7 +124,8 @@ func main() {
 	}
 
 	// Setup application logger (debug level for our code)
-	logger := slog.New(slog.NewTextHandler(machine.Serial, &slog.HandlerOptions{
+	// Uses telemetry.SlogHandler to bridge logs to both console and OpenTelemetry
+	logger := slog.New(telemetry.NewSlogHandler(machine.Serial, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
 	}))
 
@@ -145,7 +147,20 @@ func main() {
 	machine.Watchdog.Start()
 	logger.Info("init:watchdog-started")
 
-	logger.Info("init:complete")
+	// Log boot info
+	bootPartition := "A"
+	if ota.GetCurrentPartition() == ota.PartitionB {
+		bootPartition = "B"
+	}
+	shortSHA := version.GitSHA
+	if len(shortSHA) > 7 {
+		shortSHA = shortSHA[:7]
+	}
+	logger.Info("init:complete",
+		slog.String("version", version.Version),
+		slog.String("sha", shortSHA),
+		slog.String("partition", bootPartition),
+	)
 
 	// Get MQTT broker address from config
 	brokerAddr, err := config.BrokerAddr()
@@ -202,6 +217,14 @@ func main() {
 	// Get network stack reference
 	stack := cystack.LnetoStack()
 
+	// Initialize telemetry (non-fatal if collector not configured)
+	collectorAddr, err := config.TelemetryCollectorAddr()
+	if err != nil {
+		logger.Warn("telemetry:config-invalid", slog.String("err", err.Error()))
+	} else if err := telemetry.Init(stack, logger, collectorAddr); err != nil {
+		logger.Warn("telemetry:init-failed", slog.String("err", err.Error()))
+	}
+
 	// Start debug console server
 	go consoleServer(stack, logger, refreshChan)
 
@@ -218,9 +241,16 @@ func main() {
 		// Track MQTT attempt
 		wifiStats.lastMQTTAttempt = time.Now()
 
+		// Generate trace context for this refresh cycle
+		telemetry.GenerateTraceID(stack)
+
+		// Start span for MQTT refresh
+		spanIdx := telemetry.StartSpan(stack, "mqtt-refresh")
+
 		// Fetch schedule via MQTT (also syncs time from response)
 		jobs, err := fetchScheduleViaMQTT(stack, brokerAddr, logger)
 		if err != nil {
+			telemetry.EndSpan(spanIdx, false) // Mark span as failed
 			logger.Error("mqtt:failed", slog.String("err", err.Error()))
 			wifiStats.mqttFailCount++
 			consecutiveFailures++
@@ -233,9 +263,16 @@ func main() {
 			goto sleep
 		}
 
+		// End span successfully
+		telemetry.EndSpan(spanIdx, true)
+
 		// Track MQTT success
 		wifiStats.lastMQTTSuccess = time.Now()
 		wifiStats.mqttSuccessCount++
+
+		// Record metrics
+		telemetry.RecordCounter("mqtt.success.count", int64(wifiStats.mqttSuccessCount))
+		telemetry.RecordCounter("mqtt.fail.count", int64(wifiStats.mqttFailCount))
 
 		// Success - reset failure count and update timestamp
 		consecutiveFailures = 0

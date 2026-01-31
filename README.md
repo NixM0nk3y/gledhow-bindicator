@@ -57,6 +57,14 @@ The lneto network stack doesn't support TLS, so MQTT over plain TCP to a local b
 - Random MQTT client ID to prevent conflicts with multiple units
 - Telnet debug console with full IAC protocol support
 
+### Telemetry
+
+- OpenTelemetry-compatible logs, metrics, and traces
+- OTLP/HTTP JSON format (port 4318)
+- Automatic slog bridge for application logs
+- Distributed tracing with trace context propagation
+- See `docs/telemetry.md` for full documentation
+
 ## Watchdog & Recovery
 
 The device has multiple layers of fault recovery:
@@ -114,6 +122,16 @@ your-secure-password
 ```
 
 The console uses progressive lockout after failed attempts (5s after 3 failures, 30s after 5, 5min after 10).
+
+### Telemetry Collector (Optional)
+
+Create `config/telemetry_collector.text` with your OTLP collector address:
+
+```
+192.168.1.100:4318
+```
+
+The device sends logs, metrics, and traces to this endpoint. If not configured, telemetry is disabled.
 
 ## MQTT Topics
 
@@ -310,6 +328,8 @@ Or use the CLI tool which handles authentication automatically:
 | `led-green`        | Toggle green LED                                                |
 | `led-black`        | Toggle black LED                                                |
 | `led-brown`        | Toggle brown LED                                                |
+| `telemetry`        | Show telemetry status (queues, sent counts, errors)             |
+| `telemetry-flush`  | Force immediate flush of telemetry queues                       |
 | `reboot`           | Reboot the device immediately                                   |
 
 ## Serial Monitor
@@ -332,9 +352,10 @@ tinygo monitor
 │   └── cli/          # CLI tool for interacting with device
 │       └── main.go
 ├── config/
-│   ├── config.go     # Broker config embedding
-│   ├── broker.text   # MQTT broker address
-│   └── clientid.text # MQTT client ID prefix
+│   ├── config.go              # Config embedding
+│   ├── broker.text            # MQTT broker address
+│   ├── clientid.text          # MQTT client ID prefix
+│   └── telemetry_collector.text # OTLP collector address
 ├── credentials/
 │   ├── credentials.go
 │   ├── ssid.text             # WiFi SSID
@@ -342,11 +363,16 @@ tinygo monitor
 │   └── console_password.text # Debug console password
 ├── ota/
 │   └── ota.go        # OTA update support (ROM function wrappers)
+├── telemetry/
+│   ├── telemetry.go  # OTLP telemetry (logs, metrics, traces)
+│   ├── json.go       # Zero-allocation JSON serialization
+│   └── slog.go       # slog.Handler bridge
 ├── partitions/
 │   └── bindicator.json  # A/B partition table for OTA
 ├── docs/
 │   ├── ota.md                # OTA system documentation
-│   └── debug-console.md      # Debug console implementation notes
+│   ├── debug-console.md      # Debug console implementation notes
+│   └── telemetry.md          # Telemetry configuration and usage
 ├── version/
 │   └── version.go    # Build info (injected via ldflags)
 ├── nodered/
@@ -365,16 +391,19 @@ tinygo monitor
 
 ## Memory Usage
 
-Static buffer allocation (~12KB total):
+Static buffer allocation (~20KB total):
 
-| Buffer           | Size       | Notes                |
-| ---------------- | ---------- | -------------------- |
-| TCP RX/TX (MQTT) | 4060 bytes | Shared RX/TX         |
-| MQTT decoder     | 512 bytes  | User buffer          |
-| Console buffers  | 3072 bytes | RX + TX + work       |
-| Job storage      | 80 bytes   | Max 15 jobs          |
-| OTA chunk buffer | 4096 bytes | Allocated during OTA |
-| OTA hash buffer  | 512 bytes  | Allocated during OTA |
+| Buffer             | Size       | Notes                      |
+| ------------------ | ---------- | -------------------------- |
+| TCP RX/TX (MQTT)   | 4060 bytes | Shared RX/TX               |
+| MQTT decoder       | 512 bytes  | User buffer                |
+| Console buffers    | 3072 bytes | RX + TX + work             |
+| Job storage        | 80 bytes   | Max 15 jobs                |
+| OTA chunk buffer   | 4096 bytes | Allocated during OTA       |
+| OTA hash buffer    | 512 bytes  | Allocated during OTA       |
+| Telemetry TCP      | 3072 bytes | RX + TX buffers            |
+| Telemetry body     | 2048 bytes | JSON payload buffer        |
+| Telemetry queues   | ~2KB       | Logs, metrics, spans       |
 
 The firmware uses a zero-heap design with pre-allocated buffers for predictable memory usage on the Pico 2's 264KB RAM.
 
@@ -393,6 +422,8 @@ Tests cover:
 - LED/schedule logic (`bindicator_test.go`)
 - CSV response parsing (`parse_test.go`)
 - UF2 extraction (`cmd/cli/ota_test.go`)
+- Telemetry logs, metrics, spans (`telemetry/telemetry_test.go`)
+- OTLP JSON serialization (`telemetry/json_test.go`)
 
 ## References
 
