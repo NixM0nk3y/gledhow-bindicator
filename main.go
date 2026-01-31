@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"machine"
 	"net/netip"
+	"runtime"
 	"time"
 
 	"openenterprise/bindicator/config"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/soypat/cyw43439"
 	"github.com/soypat/cyw43439/examples/cywnet"
+	"github.com/soypat/lneto/x/xnet"
 )
 
 // Configuration (loaded from config files, with defaults)
@@ -52,6 +54,15 @@ var lastScheduleFetch time.Time
 // ForceScheduleRefresh forces the next wake cycle to refresh the schedule
 // (used by manual refresh command)
 var forceScheduleRefresh bool
+
+// NTP tracking
+var (
+	lastNTPSync   time.Time
+	ntpSyncCount  int
+	ntpFailCount  int
+	ntpTimeOffset time.Duration  // Last known offset from NTP
+	dnsServers    []netip.Addr   // DNS servers from DHCP (for NTP lookups)
+)
 
 // Functional watchdog thresholds
 const (
@@ -238,8 +249,19 @@ func main() {
 	// Track WiFi connection time
 	wifiStats.connectTime = time.Now()
 
+	// Store DNS servers for NTP lookups
+	dnsServers = dhcpResults.DNSServers
+
 	// Get network stack reference
 	stack := cystack.LnetoStack()
+
+	// Sync time via NTP before telemetry init (so telemetry has correct timestamps)
+	logger.Info("ntp:init", slog.String("server", config.NTPServer()))
+	if _, err := syncNTP(stack, dnsServers, logger); err != nil {
+		// NTP failure is non-fatal, but log it prominently
+		logger.Warn("ntp:init-failed", slog.String("err", err.Error()))
+		logger.Warn("ntp:time-not-synced", slog.String("fallback", "MQTT timestamp"))
+	}
 
 	// Initialize telemetry (non-fatal if collector not configured)
 	collectorAddr, err := config.TelemetryCollectorAddr()
@@ -285,6 +307,17 @@ func main() {
 		)
 
 		if needsScheduleRefresh {
+			// Resync NTP on schedule refresh cycles to maintain accurate time
+			ntpSpanIdx := telemetry.StartSpan(stack, "ntp-sync")
+			if _, err := syncNTP(stack, dnsServers, logger); err != nil {
+				telemetry.EndSpan(ntpSpanIdx, false)
+				logger.Warn("ntp:resync-failed", slog.String("err", err.Error()))
+			} else {
+				telemetry.EndSpan(ntpSpanIdx, true)
+			}
+
+			feedWatchdogIfHealthy()
+
 			// Track MQTT attempt
 			wifiStats.lastMQTTAttempt = time.Now()
 
@@ -444,5 +477,115 @@ func loopForeverStack(stack *cywnet.Stack) {
 			feedWatchdogIfHealthy()
 			count = 0
 		}
+	}
+}
+
+// NTP fallback servers if primary fails
+var ntpFallbackServers = []string{
+	"time.cloudflare.com",
+	"time.google.com",
+	"pool.ntp.org",
+}
+
+// syncNTP performs NTP time synchronization.
+// Tries configured server first, then fallbacks. Tries all resolved IPs.
+// Uses exponential backoff between attempts (max 30s) to avoid hammering servers.
+// Returns the time offset applied, or an error if all attempts fail.
+func syncNTP(stack *xnet.StackAsync, dnsServers []netip.Addr, logger *slog.Logger) (time.Duration, error) {
+	// Build list of servers to try: configured first, then fallbacks
+	servers := []string{config.NTPServer()}
+	for _, fallback := range ntpFallbackServers {
+		if fallback != servers[0] { // Don't duplicate if configured matches fallback
+			servers = append(servers, fallback)
+		}
+	}
+
+	rstack := stack.StackRetrying(pollTime)
+	var lastErr error
+	backoff := 500 * time.Millisecond // Initial backoff
+	const maxBackoff = 30 * time.Second
+
+	for _, ntpHost := range servers {
+		logger.Info("ntp:trying", slog.String("server", ntpHost))
+		feedWatchdogIfHealthy()
+
+		// Small delay to let network stack settle
+		time.Sleep(100 * time.Millisecond)
+
+		// DNS lookup for NTP server
+		addrs, err := rstack.DoLookupIP(ntpHost, 5*time.Second, 2)
+		if err != nil {
+			logger.Warn("ntp:dns-failed", slog.String("server", ntpHost), slog.String("err", err.Error()))
+			lastErr = err
+
+			// Exponential backoff before trying next server
+			logger.Info("ntp:backoff", slog.Duration("wait", backoff))
+			sleepWithWatchdog(backoff)
+			backoff = backoff * 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+		logger.Info("ntp:dns-resolved", slog.String("server", ntpHost), slog.Int("addrs", len(addrs)))
+
+		// Try each resolved address
+		for i, addr := range addrs {
+			feedWatchdogIfHealthy()
+
+			// Delay between attempts to let network stack process
+			time.Sleep(200 * time.Millisecond)
+
+			logger.Info("ntp:requesting", slog.String("addr", addr.String()), slog.Int("attempt", i+1))
+
+			// Use shorter timeout per address since we'll try multiple
+			offset, err := rstack.DoNTP(addr, 5*time.Second, 3)
+			if err != nil {
+				logger.Warn("ntp:addr-failed", slog.String("addr", addr.String()), slog.String("err", err.Error()))
+				lastErr = err
+
+				// Exponential backoff before trying next address
+				logger.Info("ntp:backoff", slog.Duration("wait", backoff))
+				sleepWithWatchdog(backoff)
+				backoff = backoff * 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				continue
+			}
+
+			// Success - apply time offset
+			runtime.AdjustTimeOffset(int64(offset))
+			ntpTimeOffset = offset
+			lastNTPSync = time.Now()
+			ntpSyncCount++
+
+			logger.Info("ntp:synced",
+				slog.String("server", ntpHost),
+				slog.String("addr", addr.String()),
+				slog.String("time", time.Now().Format("2006-01-02 15:04:05")),
+				slog.Duration("offset", offset),
+			)
+			return offset, nil
+		}
+	}
+
+	// All servers/addresses failed
+	ntpFailCount++
+	logger.Error("ntp:all-failed", slog.Int("servers_tried", len(servers)))
+	return 0, lastErr
+}
+
+// sleepWithWatchdog sleeps for the given duration while keeping the watchdog fed
+func sleepWithWatchdog(d time.Duration) {
+	// Sleep in 2-second chunks to keep watchdog fed (8s timeout)
+	for d > 0 {
+		chunk := 2 * time.Second
+		if d < chunk {
+			chunk = d
+		}
+		time.Sleep(chunk)
+		feedWatchdogIfHealthy()
+		d -= chunk
 	}
 }

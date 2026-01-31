@@ -31,7 +31,11 @@ The lneto network stack doesn't support TLS, so MQTT over plain TCP to a local b
   - Wakes every 15 minutes (configurable) to process LED states
   - Fetches schedule via MQTT every 3 hours (configurable)
   - LEDs respond to 12-hour thresholds within 15 minutes instead of up to 3 hours
-- Automatic time synchronization from MQTT response timestamp
+- **NTP time synchronization** for accurate timestamps:
+  - Syncs time via NTP immediately after WiFi connection
+  - Resyncs on each schedule refresh cycle (every 3 hours)
+  - Uses UK NTP pool by default (configurable)
+  - Ensures accurate telemetry timestamps from boot
 - LED toggles ON 12 hours before collection (noon the day before)
 - LED toggles OFF 12 hours into collection day (noon on collection day)
 - Stores up to 15 scheduled jobs
@@ -153,6 +157,16 @@ The device uses decoupled intervals for LED processing and schedule fetching:
 
 This decoupling ensures LEDs respond to the 12-hour collection threshold within the wake interval (15 minutes by default), rather than waiting for the next schedule fetch (up to 3 hours). The schedule is cached between fetches, reducing network load while maintaining responsive LED updates.
 
+### NTP Server (Optional)
+
+Create `config/ntp_server.text` with your preferred NTP server (default: uk.pool.ntp.org):
+
+```
+uk.pool.ntp.org
+```
+
+The device syncs time via NTP immediately after WiFi connection and on each schedule refresh cycle. This ensures accurate timestamps for telemetry and LED timing from boot.
+
 ## MQTT Topics
 
 | Topic                 | Direction       | Format                                          |
@@ -164,13 +178,20 @@ Example response: `1737207000,2026-01-17:BLACK,2026-01-31:GREEN,2026-02-14:BROWN
 
 ### Time Synchronization
 
-The Unix timestamp prefix syncs the device clock on every successful MQTT fetch. This is critical because:
+The device uses NTP as the primary time source, with MQTT timestamp as a fallback:
+
+1. **NTP sync at boot** - Immediately after WiFi/DHCP, before telemetry initialization
+2. **NTP resync** - On each schedule refresh cycle (every 3 hours by default)
+3. **MQTT fallback** - If NTP fails, time is still synced from MQTT response timestamp
+
+This is critical because:
 
 - The Pico 2 has no RTC battery backup
 - LED timing depends on accurate time (noon triggers)
+- Telemetry requires accurate timestamps from boot
 - Time resets to epoch (1970-01-01) on every reboot
 
-The device uses `runtime.AdjustTimeOffset()` to set system time from the MQTT response.
+The device uses `runtime.AdjustTimeOffset()` to set system time.
 
 ## Node-RED Flow
 
@@ -350,6 +371,8 @@ Or use the CLI tool which handles authentication automatically:
 | `led-brown`        | Toggle brown LED                                                |
 | `telemetry`        | Show telemetry status (queues, sent counts, errors)             |
 | `telemetry-flush`  | Force immediate flush of telemetry queues                       |
+| `ntp`              | Show NTP status (server, last sync, offset, sync count)         |
+| `ntp-sync`         | Trigger immediate NTP time synchronization                      |
 | `reboot`           | Reboot the device immediately                                   |
 
 ## Serial Monitor
@@ -377,7 +400,8 @@ tinygo monitor
 │   ├── clientid.text          # MQTT client ID prefix
 │   ├── telemetry_collector.text # OTLP collector address
 │   ├── wake_interval.text     # LED processing interval (default: 15m)
-│   └── schedule_refresh_interval.text # MQTT fetch interval (default: 3h)
+│   ├── schedule_refresh_interval.text # MQTT fetch interval (default: 3h)
+│   └── ntp_server.text        # NTP server hostname (default: uk.pool.ntp.org)
 ├── credentials/
 │   ├── credentials.go
 │   ├── ssid.text             # WiFi SSID

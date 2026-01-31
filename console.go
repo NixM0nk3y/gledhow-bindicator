@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"time"
 
+	"openenterprise/bindicator/config"
 	"openenterprise/bindicator/credentials"
 	"openenterprise/bindicator/ota"
 	"openenterprise/bindicator/telemetry"
@@ -60,6 +61,8 @@ const (
 	cmdReboot          = "reboot"
 	cmdTelemetry       = "telemetry"
 	cmdTelemetryFlush  = "telemetry-flush"
+	cmdNTP             = "ntp"
+	cmdNTPSync         = "ntp-sync"
 )
 
 // consoleServer runs a TCP debug console on port 23
@@ -247,8 +250,8 @@ func processCommand(conn *tcp.Conn, stack *xnet.StackAsync, cmd []byte, logger *
 
 	switch {
 	case bytesEqual(cmd, []byte(cmdHelp)):
-		writeConsole(conn, "Commands: help version status net wifi time jobs next leds ota\r\n")
-		writeConsole(conn, "  refresh, sleep <dur>, ota-enable [dur], reboot\r\n")
+		writeConsole(conn, "Commands: help version status net wifi time jobs next leds ota ntp\r\n")
+		writeConsole(conn, "  refresh, sleep <dur>, ota-enable [dur], ntp-sync, reboot\r\n")
 		writeConsole(conn, "  led-green, led-black, led-brown\r\n")
 		writeConsole(conn, "  telemetry, telemetry-flush\r\n")
 
@@ -554,6 +557,51 @@ func processCommand(conn *tcp.Conn, stack *xnet.StackAsync, cmd []byte, logger *
 		writeConsole(conn, "Flushing telemetry queues...\r\n")
 		telemetry.Flush()
 		writeConsole(conn, "Flush complete\r\n")
+
+	case bytesEqual(cmd, []byte(cmdNTP)):
+		writeConsole(conn, "NTP Status:\r\n")
+		writeConsole(conn, "  Server:     ")
+		writeConsole(conn, config.NTPServer())
+		writeConsole(conn, "\r\n  Last sync:  ")
+		if lastNTPSync.IsZero() {
+			writeConsole(conn, "never\r\n")
+		} else {
+			writeConsole(conn, lastNTPSync.Format("15:04:05"))
+			writeConsole(conn, " (")
+			mins := int(time.Since(lastNTPSync).Minutes())
+			writeInt(conn, mins)
+			writeConsole(conn, "m ago)\r\n")
+		}
+		writeConsole(conn, "  Offset:     ")
+		if ntpTimeOffset == 0 && lastNTPSync.IsZero() {
+			writeConsole(conn, "unknown\r\n")
+		} else {
+			writeInt(conn, int(ntpTimeOffset.Milliseconds()))
+			writeConsole(conn, "ms\r\n")
+		}
+		writeConsole(conn, "  Syncs:      ")
+		writeInt(conn, ntpSyncCount)
+		writeConsole(conn, "\r\n  Failures:   ")
+		writeInt(conn, ntpFailCount)
+		writeConsole(conn, "\r\n")
+
+	case bytesEqual(cmd, []byte(cmdNTPSync)):
+		writeConsole(conn, "Triggering NTP sync...\r\n")
+		conn.Flush()
+		offset, err := syncNTP(stack, dnsServers, logger)
+		if err != nil {
+			writeConsole(conn, "NTP sync failed: ")
+			writeConsole(conn, err.Error())
+			writeConsole(conn, "\r\n")
+		} else {
+			writeConsole(conn, "NTP sync complete\r\n")
+			writeConsole(conn, "  Time:   ")
+			writeConsole(conn, time.Now().Format("2006-01-02 15:04:05"))
+			writeConsole(conn, " UTC\r\n")
+			writeConsole(conn, "  Offset: ")
+			writeInt(conn, int(offset.Milliseconds()))
+			writeConsole(conn, "ms\r\n")
+		}
 
 	default:
 		writeConsole(conn, "Unknown command: ")

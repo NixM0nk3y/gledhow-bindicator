@@ -22,6 +22,9 @@ var (
 
 	//go:embed schedule_refresh_interval.text
 	scheduleRefreshIntervalStr string
+
+	//go:embed ntp_server.text
+	ntpServer string
 )
 
 // BrokerAddr returns the MQTT broker address from broker.text file.
@@ -55,4 +58,10 @@ func WakeInterval() (time.Duration, error) {
 // Default: 3h (from schedule_refresh_interval.text)
 func ScheduleRefreshInterval() (time.Duration, error) {
 	return time.ParseDuration(strings.TrimSpace(scheduleRefreshIntervalStr))
+}
+
+// NTPServer returns the NTP server hostname for time synchronization.
+// Default: pool.ntp.org (from ntp_server.text)
+func NTPServer() string {
+	return strings.TrimSpace(ntpServer)
 }
