@@ -20,9 +20,10 @@ import (
 	"github.com/soypat/cyw43439/examples/cywnet"
 )
 
-// Configuration
+// Configuration (loaded from config files, with defaults)
 var (
-	wakeInterval = 3 * time.Hour
+	wakeInterval            = 15 * time.Minute // How often to wake and process LEDs
+	scheduleRefreshInterval = 3 * time.Hour    // How often to fetch schedule from MQTT
 )
 
 // Global WiFi stack reference for shutdown
@@ -44,6 +45,13 @@ var (
 	consecutiveFailures   int
 	systemHealthy         = true // When false, stop feeding watchdog to trigger reset
 )
+
+// Schedule refresh tracking (separate from watchdog state)
+var lastScheduleFetch time.Time
+
+// ForceScheduleRefresh forces the next wake cycle to refresh the schedule
+// (used by manual refresh command)
+var forceScheduleRefresh bool
 
 // Functional watchdog thresholds
 const (
@@ -170,6 +178,22 @@ func main() {
 	}
 	logger.Info("config:broker", slog.String("addr", brokerAddr.String()))
 
+	// Load timing configuration
+	if interval, err := config.WakeInterval(); err == nil {
+		wakeInterval = interval
+	} else {
+		logger.Warn("config:wake-interval-invalid", slog.String("err", err.Error()), slog.Duration("default", wakeInterval))
+	}
+	if interval, err := config.ScheduleRefreshInterval(); err == nil {
+		scheduleRefreshInterval = interval
+	} else {
+		logger.Warn("config:schedule-refresh-interval-invalid", slog.String("err", err.Error()), slog.Duration("default", scheduleRefreshInterval))
+	}
+	logger.Info("config:timing",
+		slog.Duration("wake_interval", wakeInterval),
+		slog.Duration("schedule_refresh_interval", scheduleRefreshInterval),
+	)
+
 	// Initialize WiFi (use quieter logger for network stack)
 	devcfg := cyw43439.DefaultWifiConfig()
 	devcfg.Logger = netLogger
@@ -233,64 +257,103 @@ func main() {
 
 	// Initialize last successful refresh to now (give grace period on boot)
 	lastSuccessfulRefresh = time.Now()
+	// Initialize last schedule fetch to zero so first cycle always fetches
+	lastScheduleFetch = time.Time{}
 
-	// Main loop - time is synced via MQTT response
+	// Main loop - decoupled schedule refresh from LED processing
+	// LEDs are processed every wakeInterval (default 15m) for responsive updates
+	// Schedule is fetched every scheduleRefreshInterval (default 3h) to reduce network load
 	for {
 		feedWatchdogIfHealthy()
 
-		// Track MQTT attempt
-		wifiStats.lastMQTTAttempt = time.Now()
-
-		// Generate trace context for this refresh cycle
+		// Generate trace context for this wake cycle
 		telemetry.GenerateTraceID(stack)
 
-		// Start span for MQTT refresh
-		spanIdx := telemetry.StartSpan(stack, "mqtt-refresh")
+		// Start span for wake cycle
+		cycleSpanIdx := telemetry.StartSpan(stack, "wake-cycle")
 
-		// Fetch schedule via MQTT (also syncs time from response)
-		jobs, err := fetchScheduleViaMQTT(stack, brokerAddr, logger)
-		if err != nil {
-			telemetry.EndSpan(spanIdx, false) // Mark span as failed
-			logger.Error("mqtt:failed", slog.String("err", err.Error()))
-			wifiStats.mqttFailCount++
-			consecutiveFailures++
-			logger.Warn("watchdog:failure-count",
-				slog.Int("consecutive", consecutiveFailures),
-				slog.Int("max", maxConsecutiveFailures),
-			)
-			logger.Info("leds:keeping-previous-state")
-			checkSystemHealth(logger)
-			goto sleep
-		}
+		// Check if schedule refresh is needed
+		timeSinceLastFetch := time.Since(lastScheduleFetch)
+		needsScheduleRefresh := timeSinceLastFetch >= scheduleRefreshInterval || forceScheduleRefresh
+		manualRefresh := forceScheduleRefresh
+		forceScheduleRefresh = false // Reset the flag
 
-		// End span successfully
-		telemetry.EndSpan(spanIdx, true)
-
-		// Track MQTT success
-		wifiStats.lastMQTTSuccess = time.Now()
-		wifiStats.mqttSuccessCount++
-
-		// Record metrics
-		telemetry.RecordCounter("mqtt.success.count", int64(wifiStats.mqttSuccessCount))
-		telemetry.RecordCounter("mqtt.fail.count", int64(wifiStats.mqttFailCount))
-
-		// Success - reset failure count and update timestamp
-		consecutiveFailures = 0
-		lastSuccessfulRefresh = time.Now()
-		logger.Info("watchdog:refresh-success",
-			slog.String("time", lastSuccessfulRefresh.Format("15:04:05")),
+		logger.Info("cycle:start",
+			slog.Duration("since_last_fetch", timeSinceLastFetch),
+			slog.Bool("needs_refresh", needsScheduleRefresh),
+			slog.Bool("manual_refresh", manualRefresh),
 		)
+
+		if needsScheduleRefresh {
+			// Track MQTT attempt
+			wifiStats.lastMQTTAttempt = time.Now()
+
+			// Start child span for MQTT refresh
+			mqttSpanIdx := telemetry.StartSpan(stack, "mqtt-refresh")
+
+			logger.Info("schedule:fetching")
+
+			// Fetch schedule via MQTT (also syncs time from response)
+			jobs, err := fetchScheduleViaMQTT(stack, brokerAddr, logger)
+			if err != nil {
+				telemetry.EndSpan(mqttSpanIdx, false) // Mark span as failed
+				logger.Error("mqtt:failed", slog.String("err", err.Error()))
+				wifiStats.mqttFailCount++
+				consecutiveFailures++
+				logger.Warn("watchdog:failure-count",
+					slog.Int("consecutive", consecutiveFailures),
+					slog.Int("max", maxConsecutiveFailures),
+				)
+				logger.Info("schedule:using-cached",
+					slog.Int("cached_jobs", len(getJobs())),
+				)
+				checkSystemHealth(logger)
+			} else {
+				// End MQTT span successfully
+				telemetry.EndSpan(mqttSpanIdx, true)
+
+				// Track MQTT success
+				wifiStats.lastMQTTSuccess = time.Now()
+				wifiStats.mqttSuccessCount++
+				lastScheduleFetch = time.Now()
+
+				// Record metrics
+				telemetry.RecordCounter("mqtt.success.count", int64(wifiStats.mqttSuccessCount))
+				telemetry.RecordCounter("mqtt.fail.count", int64(wifiStats.mqttFailCount))
+
+				// Success - reset failure count and update timestamp
+				consecutiveFailures = 0
+				lastSuccessfulRefresh = time.Now()
+				logger.Info("schedule:fetched",
+					slog.Int("jobs", len(jobs)),
+					slog.String("time", lastSuccessfulRefresh.Format("15:04:05")),
+				)
+			}
+		}
 
 		feedWatchdogIfHealthy()
 
-		// Update LEDs based on schedule
-		logger.Info("schedule:updating-leds", slog.Int("jobs", len(jobs)))
-		updateLEDsFromSchedule(jobs, time.Now())
+		// Always process LEDs based on current schedule (cached or fresh)
+		// This ensures LEDs respond to 12-hour thresholds within wakeInterval
+		ledSpanIdx := telemetry.StartSpan(stack, "led-update")
+		jobs := getJobs()
+		now := time.Now()
+		logger.Info("leds:processing",
+			slog.Int("jobs", len(jobs)),
+			slog.String("time", now.Format("15:04:05")),
+		)
+		updateLEDsFromSchedule(jobs, now)
 		logLEDState(logger)
+		telemetry.EndSpan(ledSpanIdx, true)
 
-	sleep:
+		// End wake cycle span
+		telemetry.EndSpan(cycleSpanIdx, true)
+
 		// Sleep until next cycle, but wake early on manual refresh request
-		logger.Info("sleep:starting", slog.Duration("duration", wakeInterval))
+		logger.Info("sleep:starting",
+			slog.Duration("duration", wakeInterval),
+			slog.Duration("until_next_refresh", scheduleRefreshInterval-time.Since(lastScheduleFetch)),
+		)
 		sleepWithRefreshCheck(wakeInterval, refreshChan, logger)
 		logger.Info("sleep:waking")
 	}
@@ -316,6 +379,7 @@ func sleepWithRefreshCheck(duration time.Duration, refreshChan chan struct{}, lo
 		select {
 		case <-refreshChan:
 			logger.Info("sleep:manual-refresh-triggered")
+			forceScheduleRefresh = true // Force schedule fetch on next cycle
 			return
 		case <-time.After(checkInterval):
 			elapsed += checkInterval

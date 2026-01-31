@@ -27,8 +27,10 @@ The lneto network stack doesn't support TLS, so MQTT over plain TCP to a local b
 
 ### Core Functionality
 
-- Wakes every 3 hours to check bin collection schedule
-- Fetches schedule via MQTT from Node-RED
+- **Decoupled schedule refresh and LED processing** for responsive LED updates:
+  - Wakes every 15 minutes (configurable) to process LED states
+  - Fetches schedule via MQTT every 3 hours (configurable)
+  - LEDs respond to 12-hour thresholds within 15 minutes instead of up to 3 hours
 - Automatic time synchronization from MQTT response timestamp
 - LED toggles ON 12 hours before collection (noon the day before)
 - LED toggles OFF 12 hours into collection day (noon on collection day)
@@ -132,6 +134,24 @@ Create `config/telemetry_collector.text` with your OTLP collector address:
 ```
 
 The device sends logs, metrics, and traces to this endpoint. If not configured, telemetry is disabled.
+
+### Timing Configuration (Optional)
+
+The device uses decoupled intervals for LED processing and schedule fetching:
+
+**`config/wake_interval.text`** - How often to wake and process LEDs (default: 15m):
+
+```
+15m
+```
+
+**`config/schedule_refresh_interval.text`** - How often to fetch schedule from MQTT (default: 3h):
+
+```
+3h
+```
+
+This decoupling ensures LEDs respond to the 12-hour collection threshold within the wake interval (15 minutes by default), rather than waiting for the next schedule fetch (up to 3 hours). The schedule is cached between fetches, reducing network load while maintaining responsive LED updates.
 
 ## MQTT Topics
 
@@ -355,7 +375,9 @@ tinygo monitor
 │   ├── config.go              # Config embedding
 │   ├── broker.text            # MQTT broker address
 │   ├── clientid.text          # MQTT client ID prefix
-│   └── telemetry_collector.text # OTLP collector address
+│   ├── telemetry_collector.text # OTLP collector address
+│   ├── wake_interval.text     # LED processing interval (default: 15m)
+│   └── schedule_refresh_interval.text # MQTT fetch interval (default: 3h)
 ├── credentials/
 │   ├── credentials.go
 │   ├── ssid.text             # WiFi SSID
